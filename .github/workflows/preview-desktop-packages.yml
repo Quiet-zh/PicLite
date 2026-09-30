@@ -1,0 +1,68 @@
+name: Build preview desktop packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/builtin-tools-preview
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64 preview
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis,msi
+            artifact: PicLite-Windows-x64-preview
+          - name: macOS Intel preview
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            bundles: dmg
+            artifact: PicLite-macOS-x64-preview
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: npm ci
+      - name: Validate renderer and native code
+        run: |
+          npx tsc --noEmit
+          npm run desktop:renderer
+          node --experimental-strip-types --test tests/operation-feedback.test.mjs tests/watch-settings.test.mjs
+          cargo test --release --manifest-path src-tauri/Cargo.toml --locked --target ${{ matrix.target }}
+      - name: Build installers
+        uses: tauri-apps/tauri-action@v1
+        with:
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+          uploadWorkflowArtifacts: true
+          workflowArtifactNamePattern: ${{ matrix.artifact }}-[bundle]
+      - name: Package Windows portable build
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "portable/PicLite-Windows-x64-preview-portable"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item "src-tauri/target/${{ matrix.target }}/release/piclite.exe" "$dir/PicLite.exe"
+          Set-Content "$dir/portable.txt" "PicLite portable mode"
+          Copy-Item "docs/PORTABLE.txt" "$dir/README.txt"
+          Compress-Archive -Path "$dir/*" -DestinationPath "PicLite-Windows-x64-preview-portable.zip"
+      - name: Upload Windows portable build
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: PicLite-Windows-x64-preview-portable
+          path: PicLite-Windows-x64-preview-portable.zip
