@@ -16,6 +16,9 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::{Local, Utc};
+use fast_image_resize::{
+    images::Image as FastImage, PixelType as FastPixelType, Resizer as FastResizer,
+};
 use hmac::{Hmac, Mac};
 use image::{
     codecs::{
@@ -29,6 +32,7 @@ use image::{
 };
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use rayon::prelude::*;
 use regex::Regex;
 use reqwest::{blocking::Client, Method, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -195,6 +199,14 @@ struct QuickCompressSettings {
     fixed_folder: Option<String>,
     #[serde(default)]
     target_size_kb: u32,
+    #[serde(default)]
+    resize: bool,
+    #[serde(default)]
+    resize_mode: String,
+    #[serde(default)]
+    max_width: u32,
+    #[serde(default)]
+    max_height: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -345,6 +357,8 @@ struct WatcherSettings {
     scale: f64,
     format: String,
     resize: bool,
+    #[serde(default)]
+    resize_mode: String,
     max_width: u32,
     max_height: u32,
     strip_metadata: bool,
@@ -1027,6 +1041,7 @@ fn write_converted_without_overwrite(
         scale: 100.0,
         format: request.output_format.clone(),
         resize: false,
+        resize_mode: "shrink".to_string(),
         max_width: u32::MAX,
         max_height: u32::MAX,
         strip_metadata: true,
@@ -1078,17 +1093,21 @@ fn execute_batch_rename(request: &BatchRenameRequest) -> Result<BatchRenameResul
 
     let mut staged = Vec::<(PathBuf, PathBuf, PathBuf)>::new();
     if request.preserve_original && convert {
-        let mut completed = Vec::<PathBuf>::new();
-        for (source, target) in &runnable {
-            if let Err(error) = write_converted_without_overwrite(source, source, target, request) {
-                for path in completed.iter().rev() {
-                    let _ = fs::remove_file(path);
-                }
-                return Err(format!("无法转换到 {}：{error}", target.to_string_lossy()));
+        let attempts = runnable
+            .par_iter()
+            .map(|(source, target)| {
+                write_converted_without_overwrite(source, source, target, request)
+                    .map(|_| target.clone())
+                    .map_err(|error| format!("无法转换到 {}：{error}", target.to_string_lossy()))
+            })
+            .collect::<Vec<_>>();
+        if let Some(error) = attempts.iter().find_map(|attempt| attempt.as_ref().err()) {
+            for path in attempts.iter().filter_map(|attempt| attempt.as_ref().ok()) {
+                let _ = fs::remove_file(path);
             }
-            completed.push(target.clone());
+            return Err(error.clone());
         }
-        result.renamed = completed.len();
+        result.renamed = attempts.len();
         result.skipped = result.entries.len().saturating_sub(result.renamed);
         return Ok(result);
     }
@@ -1105,28 +1124,30 @@ fn execute_batch_rename(request: &BatchRenameRequest) -> Result<BatchRenameResul
     }
 
     if convert {
-        let mut completed = Vec::<PathBuf>::new();
-        for (source, target, temporary) in &staged {
-            if let Err(error) =
+        let attempts = staged
+            .par_iter()
+            .map(|(source, target, temporary)| {
                 write_converted_without_overwrite(temporary, source, target, request)
-            {
-                for path in completed.iter().rev() {
-                    let _ = fs::remove_file(path);
-                }
-                for (remaining_source, _, remaining_temporary) in staged.iter().rev() {
-                    if remaining_temporary.exists() {
-                        let _ = move_without_overwrite(remaining_temporary, remaining_source);
-                    }
-                }
-                return Err(format!("无法转换到 {}：{error}", target.to_string_lossy()));
+                    .map(|_| target.clone())
+                    .map_err(|error| format!("无法转换到 {}：{error}", target.to_string_lossy()))
+            })
+            .collect::<Vec<_>>();
+        if let Some(error) = attempts.iter().find_map(|attempt| attempt.as_ref().err()) {
+            for path in attempts.iter().filter_map(|attempt| attempt.as_ref().ok()) {
+                let _ = fs::remove_file(path);
             }
-            completed.push(target.clone());
+            for (remaining_source, _, remaining_temporary) in staged.iter().rev() {
+                if remaining_temporary.exists() {
+                    let _ = move_without_overwrite(remaining_temporary, remaining_source);
+                }
+            }
+            return Err(error.clone());
         }
         for (source, _, temporary) in &staged {
             fs::remove_file(temporary)
                 .map_err(|error| format!("无法完成 {}：{error}", source.to_string_lossy()))?;
         }
-        result.renamed = completed.len();
+        result.renamed = attempts.len();
         result.skipped = result.entries.len().saturating_sub(result.renamed);
         return Ok(result);
     }
@@ -1262,7 +1283,19 @@ fn available_path(directory: &Path, requested_name: &str) -> Result<PathBuf, Str
 }
 
 fn target_dimensions(width: u32, height: u32, settings: &WatcherSettings) -> (u32, u32) {
-    let mut ratio = (settings.scale / 100.0).clamp(0.001, 1.0);
+    if settings.resize && settings.resize_mode == "exact" {
+        return (settings.max_width.max(1), settings.max_height.max(1));
+    }
+    if settings.resize && settings.resize_mode == "fit" {
+        let ratio = (settings.max_width.max(1) as f64 / width.max(1) as f64)
+            .min(settings.max_height.max(1) as f64 / height.max(1) as f64)
+            .clamp(0.001, 8.0);
+        return (
+            ((width as f64 * ratio).round() as u32).max(1),
+            ((height as f64 * ratio).round() as u32).max(1),
+        );
+    }
+    let mut ratio = (settings.scale / 100.0).clamp(0.001, 8.0);
     if settings.resize {
         ratio = ratio
             .min(settings.max_width.max(1) as f64 / width.max(1) as f64)
@@ -1272,6 +1305,33 @@ fn target_dimensions(width: u32, height: u32, settings: &WatcherSettings) -> (u3
         ((width as f64 * ratio).round() as u32).max(1),
         ((height as f64 * ratio).round() as u32).max(1),
     )
+}
+
+fn resize_dynamic_fast(
+    image: DynamicImage,
+    width: u32,
+    height: u32,
+) -> Result<DynamicImage, String> {
+    if image.dimensions() == (width, height) {
+        return Ok(image);
+    }
+    let source_width = image.width();
+    let source_height = image.height();
+    let rgba = image.to_rgba8();
+    let source = FastImage::from_vec_u8(
+        source_width,
+        source_height,
+        rgba.into_raw(),
+        FastPixelType::U8x4,
+    )
+    .map_err(|error| format!("无法准备缩放像素：{error}"))?;
+    let mut destination = FastImage::new(width, height, FastPixelType::U8x4);
+    FastResizer::new()
+        .resize(&source, &mut destination, None)
+        .map_err(|error| format!("图片缩放失败：{error}"))?;
+    let output = image::RgbaImage::from_raw(width, height, destination.into_vec())
+        .ok_or_else(|| "无法创建缩放结果".to_string())?;
+    Ok(DynamicImage::ImageRgba8(output))
 }
 
 fn quantize_rgba(image: &mut image::RgbaImage, quality: u8) {
@@ -2093,11 +2153,7 @@ fn optimize_image_data_unconstrained(
             _ => unreachable!(),
         };
         let (target_width, target_height) = target_dimensions(width, height, settings);
-        let resized = if target_width != width || target_height != height {
-            decoded.resize_exact(target_width, target_height, FilterType::Lanczos3)
-        } else {
-            decoded
-        };
+        let resized = resize_dynamic_fast(decoded, target_width, target_height)?;
 
         if settings.format != "keep" {
             let output_extension = extension_for(Path::new("image.png"), &settings.format);
@@ -2192,11 +2248,7 @@ fn optimize_image_data_unconstrained(
     }
 
     let (target_width, target_height) = target_dimensions(width, height, settings);
-    let resized = if target_width != width || target_height != height {
-        decoded.resize_exact(target_width, target_height, FilterType::Lanczos3)
-    } else {
-        decoded
-    };
+    let resized = resize_dynamic_fast(decoded, target_width, target_height)?;
     let output_extension = if settings.format == "keep" {
         source_extension.clone()
     } else {
@@ -2284,7 +2336,7 @@ fn optimize_image_data(
     let mut best = initial;
     let mut scales = Vec::new();
     for factor in [1.0, 0.78, 0.6, 0.46, 0.34, 0.25, 0.18, 0.12] {
-        let scale = (settings.scale * factor).clamp(0.1, 100.0);
+        let scale = (settings.scale * factor).clamp(0.1, 800.0);
         if scales
             .last()
             .is_none_or(|previous: &f64| (previous - scale).abs() > 0.01)
@@ -2693,11 +2745,20 @@ fn quick_settings(value: &QuickCompressSettings) -> WatcherSettings {
         rename_template: value.rename_template.clone(),
         quality: value.quality.clamp(1, 100),
         mode,
-        scale: value.scale.clamp(0.1, 100.0),
+        scale: value.scale.clamp(0.1, 800.0),
         format: value.format.clone(),
-        resize: false,
-        max_width: u32::MAX,
-        max_height: u32::MAX,
+        resize: value.resize,
+        resize_mode: value.resize_mode.clone(),
+        max_width: if value.max_width == 0 {
+            u32::MAX
+        } else {
+            value.max_width
+        },
+        max_height: if value.max_height == 0 {
+            u32::MAX
+        } else {
+            value.max_height
+        },
         strip_metadata: value.strip_metadata,
         prevent_larger: value.prevent_larger,
         target_size_kb: value.target_size_kb,
@@ -2731,92 +2792,100 @@ async fn quick_compress_paths(
     settings: QuickCompressSettings,
 ) -> Result<Vec<QuickCompressResult>, String> {
     let compression = quick_settings(&settings);
-    let mut results = Vec::new();
-    for requested in paths {
-        let source = PathBuf::from(&requested);
-        let result = (|| -> Result<(PathBuf, u64, u64, u32, u32, bool), String> {
-            if !source.is_file() || !is_image(&source) {
-                return Err("不是支持的图片文件".to_string());
-            }
-            let source = fs::canonicalize(&source).unwrap_or(source.clone());
-            let original_bytes = fs::metadata(&source)
-                .map_err(|error| error.to_string())?
-                .len();
-            let optimized = optimize_image(&source, &compression)?;
-            let output_extension = optimized.extension;
-            let base = source
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or("image");
-            let suffix = if settings.export_suffix.trim().is_empty() {
-                "-piclite"
-            } else {
-                settings.export_suffix.trim()
-            };
-            let output_directory = if settings.export_mode == "fixed-folder" {
-                settings
-                    .fixed_folder
-                    .as_deref()
-                    .filter(|value| !value.is_empty())
-                    .map(PathBuf::from)
-                    .ok_or_else(|| "固定输出文件夹尚未设置".to_string())?
-            } else {
-                source
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .ok_or_else(|| "无法定位源文件夹".to_string())?
-            };
-            // 悬浮压缩坞始终生成新文件，避免一次拖放意外覆盖源图。
-            let (width, height) = image::load_from_memory(&optimized.bytes)
-                .map(|image| image.dimensions())
-                .or_else(|_| image::image_dimensions(&source))
-                .unwrap_or((0, 0));
-            let output_name = render_output_name(
-                &settings.rename_template,
-                base,
-                suffix,
-                &output_extension,
-                optimized.bytes.len(),
-                width,
-                height,
-            );
-            let output = available_path(&output_directory, &output_name)?;
-            fs::write(&output, &optimized.bytes).map_err(|error| error.to_string())?;
-            record_optimised_output(&output_directory, &output)?;
-            Ok((
-                output,
-                original_bytes,
-                optimized.bytes.len() as u64,
-                width,
-                height,
-                optimized.bytes.len() as u64 == original_bytes,
-            ))
-        })();
-        match result {
-            Ok((output, original_bytes, output_bytes, width, height, kept_original)) => {
-                results.push(QuickCompressResult {
+    let results = paths
+        .into_par_iter()
+        .map(|requested| {
+            let source = PathBuf::from(&requested);
+            let result = (|| -> Result<(PathBuf, u64, u64, u32, u32, bool), String> {
+                if !source.is_file() || !is_image(&source) {
+                    return Err("不是支持的图片文件".to_string());
+                }
+                let source = fs::canonicalize(&source).unwrap_or(source.clone());
+                let original_bytes = fs::metadata(&source)
+                    .map_err(|error| error.to_string())?
+                    .len();
+                let optimized = optimize_image(&source, &compression)?;
+                let output_extension = optimized.extension;
+                let base = source
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("image");
+                let suffix = if settings.export_suffix.trim().is_empty() {
+                    "-piclite"
+                } else {
+                    settings.export_suffix.trim()
+                };
+                let output_directory = if settings.export_mode == "fixed-folder" {
+                    settings
+                        .fixed_folder
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "固定输出文件夹尚未设置".to_string())?
+                } else {
+                    source
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .ok_or_else(|| "无法定位源文件夹".to_string())?
+                };
+                // 悬浮压缩坞始终生成新文件，避免一次拖放意外覆盖源图。
+                let (width, height) = image::load_from_memory(&optimized.bytes)
+                    .map(|image| image.dimensions())
+                    .or_else(|_| image::image_dimensions(&source))
+                    .unwrap_or((0, 0));
+                let output_name = render_output_name(
+                    &settings.rename_template,
+                    base,
+                    suffix,
+                    &output_extension,
+                    optimized.bytes.len(),
+                    width,
+                    height,
+                );
+                let output = {
+                    let _guard = QUICK_OUTPUT_LOCK
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    let output = available_path(&output_directory, &output_name)?;
+                    fs::write(&output, &optimized.bytes).map_err(|error| error.to_string())?;
+                    record_optimised_output(&output_directory, &output)?;
+                    output
+                };
+                Ok((
+                    output,
+                    original_bytes,
+                    optimized.bytes.len() as u64,
+                    width,
+                    height,
+                    optimized.bytes.len() as u64 == original_bytes,
+                ))
+            })();
+            match result {
+                Ok((output, original_bytes, output_bytes, width, height, kept_original)) => {
+                    QuickCompressResult {
+                        source: requested,
+                        output: Some(output.to_string_lossy().to_string()),
+                        original_bytes: Some(original_bytes),
+                        output_bytes: Some(output_bytes),
+                        width: Some(width),
+                        height: Some(height),
+                        kept_original,
+                        error: None,
+                    }
+                }
+                Err(error) => QuickCompressResult {
                     source: requested,
-                    output: Some(output.to_string_lossy().to_string()),
-                    original_bytes: Some(original_bytes),
-                    output_bytes: Some(output_bytes),
-                    width: Some(width),
-                    height: Some(height),
-                    kept_original,
-                    error: None,
-                });
+                    output: None,
+                    original_bytes: None,
+                    output_bytes: None,
+                    width: None,
+                    height: None,
+                    kept_original: false,
+                    error: Some(error),
+                },
             }
-            Err(error) => results.push(QuickCompressResult {
-                source: requested,
-                output: None,
-                original_bytes: None,
-                output_bytes: None,
-                width: None,
-                height: None,
-                kept_original: false,
-                error: Some(error),
-            }),
-        }
-    }
+        })
+        .collect();
     Ok(results)
 }
 
@@ -3034,11 +3103,7 @@ async fn compress_image_with_watermark_base64(
     let decoded = decode_static_oriented(&original)?;
     let (source_width, source_height) = decoded.dimensions();
     let (width, height) = target_dimensions(source_width, source_height, &compression);
-    let resized = if width != source_width || height != source_height {
-        decoded.resize_exact(width, height, FilterType::Lanczos3)
-    } else {
-        decoded
-    };
+    let resized = resize_dynamic_fast(decoded, width, height)?;
     let watermarked = apply_native_image_watermark(resized, &watermark)?;
     let extension = if compression.format == "keep" {
         source_extension
@@ -3267,6 +3332,7 @@ fn cleanup_marked_files(
 }
 
 static GENERATED_MANIFEST_LOCK: Mutex<()> = Mutex::new(());
+static QUICK_OUTPUT_LOCK: Mutex<()> = Mutex::new(());
 
 fn record_optimised_output(directory: &Path, output: &Path) -> Result<(), String> {
     let _guard = GENERATED_MANIFEST_LOCK
@@ -5477,9 +5543,6 @@ fn validated_watch_rules(
     };
     let mut rules: Vec<(PathBuf, WatcherSettings)> = Vec::new();
     for mut profile in profiles {
-        if profile.format != "keep" || profile.resize || profile.scale != 100.0 {
-            profile.mode = "manual".into();
-        }
         if let Some(rule) = &profile.folder_rename {
             if rule.folder_pattern.trim().is_empty() {
                 return Err("请填写文件夹匹配规则".into());
@@ -6453,6 +6516,42 @@ mod tests {
     }
 
     #[test]
+    fn resize_modes_support_proportional_upscale_fit_and_exact_dimensions() {
+        let mut settings: WatcherSettings = serde_json::from_value(serde_json::json!({
+            "inputFolder": "", "inputFolders": [], "outputFolder": "",
+            "mode": "manual", "quality": 86, "scale": 200, "format": "keep",
+            "resize": false, "maxWidth": 800, "maxHeight": 800,
+            "stripMetadata": true, "preventLarger": false
+        }))
+        .expect("resize settings");
+        assert_eq!(target_dimensions(400, 200, &settings), (800, 400));
+
+        settings.resize = true;
+        settings.resize_mode = "fit".into();
+        settings.max_width = 900;
+        settings.max_height = 300;
+        assert_eq!(target_dimensions(400, 200, &settings), (600, 300));
+
+        settings.resize_mode = "exact".into();
+        assert_eq!(target_dimensions(400, 200, &settings), (900, 300));
+    }
+
+    #[test]
+    fn simd_resize_preserves_alpha_and_requested_dimensions() {
+        let image = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(20, 10, |x, y| {
+            image::Rgba([
+                x as u8 * 10,
+                y as u8 * 20,
+                140,
+                if x % 2 == 0 { 80 } else { 255 },
+            ])
+        }));
+        let resized = resize_dynamic_fast(image, 80, 40).expect("SIMD resize");
+        assert_eq!(resized.dimensions(), (80, 40));
+        assert!(resized.to_rgba8().pixels().any(|pixel| pixel.0[3] < 255));
+    }
+
+    #[test]
     fn rename_template_expands_size_dimensions_and_extension() {
         let name = render_output_name(
             "{name}_{width}x{height}_{size}{suffix}.{ext}",
@@ -6512,6 +6611,7 @@ mod tests {
             scale: 100.0,
             format: "keep".to_string(),
             resize: false,
+            resize_mode: "shrink".to_string(),
             max_width: u32::MAX,
             max_height: u32::MAX,
             strip_metadata: true,
@@ -6559,6 +6659,7 @@ mod tests {
             scale: 100.0,
             format: "keep".to_string(),
             resize: false,
+            resize_mode: "shrink".to_string(),
             max_width: u32::MAX,
             max_height: u32::MAX,
             strip_metadata: true,
@@ -6610,6 +6711,7 @@ mod tests {
             scale,
             format: "keep".to_string(),
             resize: false,
+            resize_mode: "shrink".to_string(),
             max_width: u32::MAX,
             max_height: u32::MAX,
             strip_metadata: true,
@@ -6683,6 +6785,7 @@ mod tests {
             scale,
             format: "keep".to_string(),
             resize: false,
+            resize_mode: "shrink".to_string(),
             max_width: u32::MAX,
             max_height: u32::MAX,
             strip_metadata: true,
@@ -6749,6 +6852,10 @@ mod tests {
             rename_template: String::new(),
             fixed_folder: None,
             target_size_kb: 0,
+            resize: false,
+            resize_mode: "shrink".to_string(),
+            max_width: 0,
+            max_height: 0,
         };
         let settings = quick_settings(&quick);
         assert_eq!(settings.mode, "auto");
@@ -6839,6 +6946,10 @@ mod tests {
             rename_template: String::new(),
             fixed_folder: None,
             target_size_kb: 0,
+            resize: false,
+            resize_mode: "shrink".to_string(),
+            max_width: 0,
+            max_height: 0,
         };
 
         let settings = quick_settings(&quick);
@@ -6874,6 +6985,7 @@ mod tests {
             scale: 100.0,
             format: "keep".to_string(),
             resize: false,
+            resize_mode: "shrink".to_string(),
             max_width: u32::MAX,
             max_height: u32::MAX,
             strip_metadata: true,
@@ -6921,6 +7033,7 @@ mod tests {
             scale: 100.0,
             format: "image/webp".to_string(),
             resize: false,
+            resize_mode: "shrink".to_string(),
             max_width: u32::MAX,
             max_height: u32::MAX,
             strip_metadata: true,
@@ -7038,6 +7151,7 @@ mod tests {
             scale: 50.0,
             format: "keep".to_string(),
             resize: false,
+            resize_mode: "shrink".to_string(),
             max_width: u32::MAX,
             max_height: u32::MAX,
             strip_metadata: true,
@@ -7102,6 +7216,10 @@ mod tests {
             rename_template: String::new(),
             fixed_folder: None,
             target_size_kb: 0,
+            resize: false,
+            resize_mode: "shrink".to_string(),
+            max_width: 0,
+            max_height: 0,
         };
         let output = compress_animation_with_watermark_data(
             original.clone(),
@@ -7207,6 +7325,10 @@ mod tests {
                 rename_template: String::new(),
                 fixed_folder: None,
                 target_size_kb: 0,
+                resize: false,
+                resize_mode: "shrink".to_string(),
+                max_width: 0,
+                max_height: 0,
             },
             NativeAnimationWatermark {
                 kind: "visible".to_string(),
@@ -7265,6 +7387,7 @@ mod tests {
             scale: 100.0,
             format: "image/png".to_string(),
             resize: false,
+            resize_mode: "shrink".to_string(),
             max_width: u32::MAX,
             max_height: u32::MAX,
             strip_metadata: true,
@@ -7351,6 +7474,7 @@ mod tests {
             scale: 75.0,
             format: "keep".to_string(),
             resize: false,
+            resize_mode: "shrink".to_string(),
             max_width: 2560,
             max_height: 2560,
             strip_metadata: true,

@@ -18,10 +18,11 @@ import { disable as disableAutostart, enable as enableAutostart, isEnabled as is
 import { isRequestedMimeType, isSmartCompressionWorthwhile, minimumSmartSavingsBytes, smartCandidateOutputFormats } from "./compression-policy";
 import packageManifest from "../package.json";
 import { loadSettings as loadDesktopSettings, saveSettings as saveDesktopSettings } from "../desktop/clop-store";
+import { FormatConverterPlugin, ResizePlugin } from "./builtin-image-tools";
 
 type CompressionMode = "lossless" | "balanced" | "small" | "manual";
 type OutputFormat = "keep" | "image/jpeg" | "image/png" | "image/webp";
-type ViewName = "workspace" | "watcher" | "rename" | "gallery" | "preferences" | `plugin:${string}`;
+type ViewName = "workspace" | "watcher" | "rename" | "convert" | "resize" | "gallery" | "preferences" | `plugin:${string}`;
 type PreviewMode = "compare" | "original" | "result";
 type ItemStatus = "ready" | "processing" | "done" | "error";
 type ExportMode = "download" | "overwrite" | "same-folder" | "fixed-folder";
@@ -134,6 +135,7 @@ type WatcherSettings = {
   scale: number;
   format: OutputFormat;
   resize: boolean;
+  resizeMode?: "shrink" | "fit" | "exact";
   maxWidth: number;
   maxHeight: number;
   stripMetadata: boolean;
@@ -362,6 +364,10 @@ type QuickCompressSettings = {
   renameTemplate?: string;
   fixedFolder?: string;
   targetSizeKb?: number;
+  resize?: boolean;
+  resizeMode?: "shrink" | "fit" | "exact";
+  maxWidth?: number;
+  maxHeight?: number;
 };
 
 type QuickCompressResult = {
@@ -403,6 +409,8 @@ type WorkspacePlugin = {
 const BUILTIN_WORKSPACE_PLUGINS: WorkspacePlugin[] = [
   { id: "watcher", nameZh: "文件夹监测", nameEn: "Folder watch", kind: "builtin", enabled: true },
   { id: "rename", nameZh: "图片批量重命名", nameEn: "Batch image rename", kind: "builtin", enabled: true },
+  { id: "convert", nameZh: "格式转换", nameEn: "Format converter", kind: "builtin", enabled: true },
+  { id: "resize", nameZh: "尺寸调整与扩图", nameEn: "Resize & enlarge", kind: "builtin", enabled: true },
   { id: "gallery", nameZh: "图库", nameEn: "Library", kind: "builtin", enabled: true },
 ];
 
@@ -553,19 +561,37 @@ function PluginRuntime({ plugin, bridge, language, theme }: { plugin: WorkspaceP
   return <div className="plugin-runtime-shell">{error && <div className="plugin-runtime-error"><strong>{language === "en" ? "Plugin could not be loaded" : "插件载入失败"}</strong><p>{error}</p></div>}<div className="plugin-runtime" ref={hostRef} /></div>;
 }
 
-function BatchRenamePage({ bridge, language }: { bridge?: NativeBridge; language: "zh" | "en" }) {
+type RenameRulePreset = { id: string; name: string; custom?: boolean; values: Omit<BatchRenameRequest, "rootFolder"> };
+const RENAME_RULES_KEY = "piclite.renameRules.v1";
+const RENAME_LAST_REQUEST_KEY = "piclite.renameLastRequest.v1";
+const DEFAULT_RENAME_RULES: RenameRulePreset[] = [
+  { id: "numbers", name: "【1-1】 → 0101", values: { folderPattern: String.raw`[【\[]\s*(\d+)\s*-\s*(\d+)\s*[】\]]`, renameTemplate: "{code}_{name}", firstPadding: 2, secondPadding: 2, wordSeparator: "", preserveOriginal: false, outputFormat: "keep", quality: 86 } },
+  { id: "chinese", name: "风景 / 人物", values: { folderPattern: "(风景|人物)", renameTemplate: "{1}_{name}", firstPadding: 2, secondPadding: 2, wordSeparator: "", preserveOriginal: false, outputFormat: "keep", quality: 86 } },
+  { id: "english", name: "English word", values: { folderPattern: "([A-Za-z]+)", renameTemplate: "{1}_{name}", firstPadding: 2, secondPadding: 2, wordSeparator: "", preserveOriginal: false, outputFormat: "keep", quality: 86 } },
+  { id: "initials", name: "New York → NY", values: { folderPattern: "([A-Za-z]+(?:[ _-]+[A-Za-z]+)*)", renameTemplate: "{1:initials}_{name}", firstPadding: 2, secondPadding: 2, wordSeparator: "", preserveOriginal: false, outputFormat: "keep", quality: 86 } },
+];
+
+function defaultRenameRequest(): BatchRenameRequest {
+  const fallback: BatchRenameRequest = { rootFolder: "", ...DEFAULT_RENAME_RULES[0].values };
+  if (typeof window === "undefined") return fallback;
+  try { return { ...fallback, ...JSON.parse(window.localStorage.getItem(RENAME_LAST_REQUEST_KEY) || "{}"), rootFolder: "" }; }
+  catch { return fallback; }
+}
+
+function loadRenameRules() {
+  if (typeof window === "undefined") return DEFAULT_RENAME_RULES;
+  try {
+    const custom = JSON.parse(window.localStorage.getItem(RENAME_RULES_KEY) || "[]") as RenameRulePreset[];
+    return [...DEFAULT_RENAME_RULES, ...custom.filter((preset) => preset.custom)];
+  } catch { return DEFAULT_RENAME_RULES; }
+}
+
+function BatchRenamePage({ bridge, language, onCreateMonitor }: { bridge?: NativeBridge; language: "zh" | "en"; onCreateMonitor: (patch: Partial<WatcherSettings>) => void }) {
   const t = useCallback((zh: string, en: string) => language === "en" ? en : zh, [language]);
-  const [request, setRequest] = useState<BatchRenameRequest>({
-    rootFolder: "",
-    folderPattern: String.raw`[【\[]\s*(\d+)\s*-\s*(\d+)\s*[】\]]`,
-    renameTemplate: "{code}_{name}",
-    firstPadding: 2,
-    secondPadding: 2,
-    wordSeparator: "",
-    preserveOriginal: false,
-    outputFormat: "keep",
-    quality: 86,
-  });
+  const [request, setRequest] = useState<BatchRenameRequest>(defaultRenameRequest);
+  const [rulePresets, setRulePresets] = useState<RenameRulePreset[]>(loadRenameRules);
+  const [selectedRuleId, setSelectedRuleId] = useState("");
+  const [newRuleName, setNewRuleName] = useState("");
   const [preview, setPreview] = useState<BatchRenameResult | null>(null);
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
@@ -594,14 +620,39 @@ function BatchRenamePage({ bridge, language }: { bridge?: NativeBridge; language
     } catch (error) { setStatus(error instanceof Error ? error.message : String(error)); }
     finally { setBusy(false); }
   };
+  useEffect(() => {
+    const { rootFolder: _rootFolder, ...values } = request;
+    window.localStorage.setItem(RENAME_LAST_REQUEST_KEY, JSON.stringify(values));
+  }, [request]);
+  useEffect(() => {
+    window.localStorage.setItem(RENAME_RULES_KEY, JSON.stringify(rulePresets.filter((preset) => preset.custom)));
+  }, [rulePresets]);
   const applyPreset = (value: string) => {
-    const presets: Record<string, Partial<BatchRenameRequest>> = {
-      numbers: { folderPattern: String.raw`[【\[]\s*(\d+)\s*-\s*(\d+)\s*[】\]]`, renameTemplate: "{code}_{name}" },
-      chinese: { folderPattern: "(风景|人物)", renameTemplate: "{1}_{name}" },
-      english: { folderPattern: "([A-Za-z]+)", renameTemplate: "{1}_{name}" },
-      initials: { folderPattern: "([A-Za-z]+(?:[ _-]+[A-Za-z]+)*)", renameTemplate: "{1:initials}_{name}", wordSeparator: "" },
-    };
-    if (presets[value]) patch(presets[value]);
+    setSelectedRuleId(value);
+    const preset = rulePresets.find((candidate) => candidate.id === value);
+    if (preset) patch(preset.values);
+  };
+  const currentRuleValues = (): Omit<BatchRenameRequest, "rootFolder"> => {
+    const { rootFolder: _rootFolder, ...values } = request;
+    return values;
+  };
+  const saveNewRule = () => {
+    const name = newRuleName.trim();
+    if (!name) { setStatus(t("先填写规则名称", "Enter a rule name first")); return; }
+    const preset: RenameRulePreset = { id: `custom-${uid()}`, name, custom: true, values: currentRuleValues() };
+    setRulePresets((current) => [...current, preset]);
+    setSelectedRuleId(preset.id); setNewRuleName(""); setStatus(t("规则已保存", "Rule saved"));
+  };
+  const updateRule = () => {
+    const preset = rulePresets.find((candidate) => candidate.id === selectedRuleId);
+    if (!preset?.custom) { setStatus(t("内置规则请使用“另存为”保存修改", "Save a modified built-in rule as a new rule")); return; }
+    setRulePresets((current) => current.map((candidate) => candidate.id === preset.id ? { ...candidate, values: currentRuleValues() } : candidate));
+    setStatus(t("已覆盖保存当前规则", "Current rule updated"));
+  };
+  const deleteRule = () => {
+    const preset = rulePresets.find((candidate) => candidate.id === selectedRuleId);
+    if (!preset?.custom) return;
+    setRulePresets((current) => current.filter((candidate) => candidate.id !== preset.id)); setSelectedRuleId(""); setStatus(t("自定义规则已删除", "Custom rule deleted"));
   };
   return <section className="rename-page">
     <header className="rename-hero"><span className="section-index">BUILT-IN PLUGIN / RENAME</span><h1>{t("从目录里提取，", "Extract from folders,")}<br /><span>{t("批量命名。", "rename in batches.")}</span></h1><p>{t("向上查找第一个匹配的父目录，先预览，再安全重命名或转换格式。不会覆盖已有文件。", "Find the first matching parent, preview every change, then rename or convert safely without overwriting existing files.")}</p></header>
@@ -609,7 +660,8 @@ function BatchRenamePage({ bridge, language }: { bridge?: NativeBridge; language
       <div className="rename-console-head"><div><i className={preview ? "active" : ""} /><strong>{busy ? t("处理中", "WORKING") : t("规则编辑器", "RULE EDITOR")}</strong></div><small>{status || t("所有处理都在本机完成", "Everything stays on this device")}</small></div>
       <div className="rename-root"><button type="button" onClick={() => void chooseRoot()}><span>⌑</span><small>{t("扫描根目录", "Root folder")}</small><strong>{request.rootFolder || t("选择包含多级子目录的文件夹", "Choose a folder with nested images")}</strong><b>{t("选择", "Choose")}</b></button></div>
       <div className="rename-fields">
-        <label><span>{t("常用规则", "Rule preset")}</span><select defaultValue="" onChange={(event) => applyPreset(event.target.value)}><option value="">{t("选择示例，可继续修改", "Choose an editable example")}</option><option value="numbers">【1-1】 → 0101</option><option value="chinese">风景 / 人物</option><option value="english">English word</option><option value="initials">New York → NY</option></select></label>
+        <label><span>{t("已保存规则", "Saved rule")}</span><select value={selectedRuleId} onChange={(event) => applyPreset(event.target.value)}><option value="">{t("沿用上次设置", "Last-used settings")}</option>{rulePresets.map((preset) => <option value={preset.id} key={preset.id}>{preset.custom ? `★ ${preset.name}` : preset.name}</option>)}</select></label>
+        <div className="rename-rule-save"><label><span>{t("新规则名称", "New rule name")}</span><input value={newRuleName} maxLength={40} placeholder={t("例如：短横线编号", "For example: Hyphen codes")} onChange={(event) => setNewRuleName(event.target.value)} /></label><button type="button" onClick={saveNewRule}>{t("另存为", "Save as")}</button><button type="button" disabled={!rulePresets.find((preset) => preset.id === selectedRuleId)?.custom} onClick={updateRule}>{t("覆盖保存", "Update")}</button><button className="danger" type="button" disabled={!rulePresets.find((preset) => preset.id === selectedRuleId)?.custom} onClick={deleteRule}>{t("删除", "Delete")}</button></div>
         <label className="rename-pattern"><span>{t("父目录匹配规则（正则）", "Parent-folder pattern (regex)")}</span><input value={request.folderPattern} onChange={(event) => patch({ folderPattern: event.target.value })} /></label>
         <label className="rename-template"><span>{t("新文件名模板", "New filename template")}</span><input value={request.renameTemplate} onChange={(event) => patch({ renameTemplate: event.target.value })} /><small>{"{code} {name} {name:words} {name:initials} {ext} {folder} {match} {1} {2} {1:words} {1:initials} {index:03}"}</small></label>
         <label><span>{t("数字补齐位数", "Numeric padding")}</span><div className="rename-padding"><input aria-label="First padding" type="number" min="1" max="12" value={request.firstPadding} onChange={(event) => patch({ firstPadding: Math.max(1, Math.min(12, Number(event.target.value) || 1)) })} /><b>+</b><input aria-label="Second padding" type="number" min="1" max="12" value={request.secondPadding} onChange={(event) => patch({ secondPadding: Math.max(1, Math.min(12, Number(event.target.value) || 1)) })} /></div></label>
@@ -619,7 +671,7 @@ function BatchRenamePage({ bridge, language }: { bridge?: NativeBridge; language
         <label className="rename-preserve"><span>{t("原图处理", "Original files")}</span><select value={request.preserveOriginal ? "copy" : "move"} onChange={(event) => patch({ preserveOriginal: event.target.value === "copy" })}><option value="move">{t("移动原图（仅保留处理结果）", "Move originals (keep results only)")}</option><option value="copy">{t("保留原图并生成新文件", "Keep originals and create new files")}</option></select><small>{t("已有目标文件始终跳过，不会覆盖", "Existing destination files are always skipped")}</small></label>
         <p className="rename-monitor-note">{t("需要持续自动处理时，可在“文件夹监测”中同时设置输出格式和父文件夹命名规则。", "For continuous automation, configure both output format and parent-folder naming in Folder Watch.")}</p>
       </div>
-      <div className="rename-actions"><button type="button" disabled={busy || !request.rootFolder} onClick={() => void scan()}>{busy ? "···" : "⌕"} {t("扫描并预览", "Scan and preview")}</button><button className="primary" type="button" disabled={busy || !preview?.entries.some((entry) => entry.ready)} onClick={() => void apply()}>{t("执行处理", "Apply changes")}</button></div>
+      <div className="rename-actions"><button type="button" onClick={() => onCreateMonitor({ folderRename: request, format: request.outputFormat, quality: request.quality, mode: request.outputFormat === "keep" ? "lossless" : "manual" })}>◎ {t("建立监控任务", "Create watch task")}</button><button type="button" disabled={busy || !request.rootFolder} onClick={() => void scan()}>{busy ? "···" : "⌕"} {t("扫描并预览", "Scan and preview")}</button><button className="primary" type="button" disabled={busy || !preview?.entries.some((entry) => entry.ready)} onClick={() => void apply()}>{t("执行处理", "Apply changes")}</button></div>
       {preview && <div className="rename-preview"><header><strong>{t("重命名预览", "Rename preview")}</strong><span>{t(`${preview.matched} 个匹配 · ${preview.failed} 个冲突`, `${preview.matched} matches · ${preview.failed} conflicts`)}</span></header>{preview.entries.slice(0, 200).map((entry) => <div className={entry.ready ? "ready" : "blocked"} key={entry.source}><span title={entry.source}>{entry.sourceName}</span><b>→</b><span title={entry.target}>{entry.targetName || entry.error}</span><small>{entry.error || entry.code}</small></div>)}</div>}
     </div>
   </section>;
@@ -826,6 +878,7 @@ const DEFAULT_WATCHER_SETTINGS: WatcherSettings = {
   scale: 100,
   format: "keep",
   resize: false,
+  resizeMode: "shrink",
   maxWidth: 2560,
   maxHeight: 2560,
   stripMetadata: true,
@@ -3644,6 +3697,14 @@ function PicLiteWorkbench({ nativeBridge, initialView = "workspace", standaloneP
     setWatcherSettings({ ...DEFAULT_WATCHER_SETTINGS });
   }, []);
 
+  const createMonitorFromTool = useCallback((patch: Partial<WatcherSettings>) => {
+    setSelectedWatchProfileId(null);
+    setWatchProfileName("");
+    setWatcherSettings({ ...DEFAULT_WATCHER_SETTINGS, ...patch });
+    setView("watcher");
+    showToast(t("处理参数已带入新的监控任务，请选择监测文件夹", "Settings copied to a new watch task; choose a folder to watch"));
+  }, [showToast, t]);
+
   const toggleWatchProfile = useCallback(async (profile: WatchProfile) => {
     if (!nativeBridge) return;
     const next = watchProfiles.map((item) => item.id === profile.id ? { ...item, enabled: !item.enabled } : item);
@@ -3792,6 +3853,8 @@ function PicLiteWorkbench({ nativeBridge, initialView = "workspace", standaloneP
           {workspacePlugins.find((plugin) => plugin.id === "watcher")?.enabled && <button className={view === "watcher" ? "active" : ""} type="button" onClick={() => setView("watcher")}>{t("文件夹监测", "Folder watch")}{watcherActive && <span className="live-dot" aria-label={t("监测中", "Watching")} />}</button>}
           {workspacePlugins.find((plugin) => plugin.id === "gallery")?.enabled && <button className={view === "gallery" ? "active" : ""} type="button" onClick={() => setView("gallery")}>{t("图库", "Library")}</button>}
           {nativeBridge && workspacePlugins.find((plugin) => plugin.id === "rename")?.enabled && <button className={view === "rename" ? "active" : ""} type="button" onClick={() => setView("rename")}>{t("批量重命名", "Batch rename")}</button>}
+          {nativeBridge && workspacePlugins.find((plugin) => plugin.id === "convert")?.enabled && <button className={view === "convert" ? "active" : ""} type="button" onClick={() => setView("convert")}>{t("格式转换", "Convert")}</button>}
+          {nativeBridge && workspacePlugins.find((plugin) => plugin.id === "resize")?.enabled && <button className={view === "resize" ? "active" : ""} type="button" onClick={() => setView("resize")}>{t("尺寸调整", "Resize")}</button>}
           {workspacePlugins.filter((plugin) => plugin.kind !== "builtin" && plugin.enabled).map((plugin) => <button key={plugin.id} className={view === `plugin:${plugin.id}` ? "active" : ""} type="button" onClick={() => setView(`plugin:${plugin.id}`)}>{desktopPreferences.language === "zh" ? plugin.nameZh : plugin.nameEn}</button>)}
         </nav>}
         <div className="topbar-actions">
@@ -4110,7 +4173,11 @@ function PicLiteWorkbench({ nativeBridge, initialView = "workspace", standaloneP
           </aside>
         </section>
       ) : view === "rename" ? (
-        <BatchRenamePage bridge={nativeBridge} language={desktopPreferences.language} />
+        <BatchRenamePage bridge={nativeBridge} language={desktopPreferences.language} onCreateMonitor={createMonitorFromTool} />
+      ) : view === "convert" ? (
+        <FormatConverterPlugin bridge={nativeBridge} language={desktopPreferences.language} onCreateMonitor={createMonitorFromTool} />
+      ) : view === "resize" ? (
+        <ResizePlugin bridge={nativeBridge} language={desktopPreferences.language} onCreateMonitor={createMonitorFromTool} />
       ) : view === "watcher" ? (
         <section className="watcher-page">
           <div className="watcher-intro">
@@ -4153,11 +4220,11 @@ function PicLiteWorkbench({ nativeBridge, initialView = "workspace", standaloneP
                 const quality = Number(event.target.value);
                 setWatcherSettings((current) => ({ ...current, quality, mode: modeFromQuality(quality) }));
               }} /></label>
-              <label className="watcher-range"><span>{t("等比例尺寸", "Scale")} <b>{formatScale(watcherSettings.scale)}</b></span><input type="range" min="0.1" max="100" step="0.1" value={watcherSettings.scale} disabled={!nativeBridge} onChange={(event) => setWatcherSettings((current) => ({ ...current, scale: Number(event.target.value) }))} /></label>
+              <label className="watcher-range"><span>{t("等比例尺寸", "Scale")} <b>{formatScale(watcherSettings.scale)}</b></span><input type="range" min="0.1" max="400" step="0.1" value={watcherSettings.scale} disabled={!nativeBridge} onChange={(event) => setWatcherSettings((current) => ({ ...current, scale: Number(event.target.value) }))} /></label>
               <label className="watcher-check"><input type="checkbox" checked={watcherSettings.stripMetadata} disabled={!nativeBridge} onChange={(event) => setWatcherSettings((current) => ({ ...current, stripMetadata: event.target.checked }))} /><span>{t("移除隐私元数据", "Strip private metadata")}</span></label>
               <label className="watcher-check"><input type="checkbox" checked={watcherSettings.preventLarger} disabled={!nativeBridge} onChange={(event) => setWatcherSettings((current) => ({ ...current, preventLarger: event.target.checked }))} /><span>{t("候选更大时保留原图", "Keep original when candidates are larger")}</span></label>
-              <label className="watcher-check"><input type="checkbox" checked={watcherSettings.resize} disabled={!nativeBridge} onChange={(event) => setWatcherSettings((current) => ({ ...current, resize: event.target.checked }))} /><span>{t("限制最大像素尺寸", "Limit maximum pixel dimensions")}</span></label>
-              {watcherSettings.resize && <div className="watcher-dimensions"><label>{t("宽", "Width")} <input type="number" min="1" value={watcherSettings.maxWidth} disabled={!nativeBridge} onChange={(event) => setWatcherSettings((current) => ({ ...current, maxWidth: Number(event.target.value) }))} /></label><span>×</span><label>{t("高", "Height")} <input type="number" min="1" value={watcherSettings.maxHeight} disabled={!nativeBridge} onChange={(event) => setWatcherSettings((current) => ({ ...current, maxHeight: Number(event.target.value) }))} /></label><small>px</small></div>}
+              <label className="watcher-check"><input type="checkbox" checked={watcherSettings.resize} disabled={!nativeBridge} onChange={(event) => setWatcherSettings((current) => ({ ...current, resize: event.target.checked }))} /><span>{t("按目标尺寸处理（可放大）", "Resize to target dimensions (upscaling allowed)")}</span></label>
+              {watcherSettings.resize && <><label><span>{t("尺寸规则", "Resize rule")}</span><select value={watcherSettings.resizeMode || "shrink"} disabled={!nativeBridge} onChange={(event) => setWatcherSettings((current) => ({ ...current, resizeMode: event.target.value as "shrink" | "fit" | "exact" }))}><option value="shrink">{t("仅缩小到边界", "Shrink to fit only")}</option><option value="fit">{t("等比适应边界，可放大", "Fit box, allow upscale")}</option><option value="exact">{t("精确宽高，可改变比例", "Exact dimensions")}</option></select></label><div className="watcher-dimensions"><label>{t("宽", "Width")} <input type="number" min="1" value={watcherSettings.maxWidth} disabled={!nativeBridge} onChange={(event) => setWatcherSettings((current) => ({ ...current, maxWidth: Number(event.target.value) }))} /></label><span>×</span><label>{t("高", "Height")} <input type="number" min="1" value={watcherSettings.maxHeight} disabled={!nativeBridge} onChange={(event) => setWatcherSettings((current) => ({ ...current, maxHeight: Number(event.target.value) }))} /></label><small>px</small></div></>}
               <label className="watcher-check"><input type="checkbox" checked={watcherSettings.onlyWhenNeeded ?? false} disabled={!nativeBridge} onChange={(event) => setWatcherSettings((current) => ({ ...current, onlyWhenNeeded: event.target.checked }))} /><span>{t("仅格式或尺寸不符合时处理", "Only process format or size mismatches")}</span></label>
               <label className="watcher-check"><input type="checkbox" checked={watcherSettings.notifyOnComplete ?? true} disabled={!nativeBridge} onChange={(event) => setWatcherSettings((current) => ({ ...current, notifyOnComplete: event.target.checked }))} /><span>{t("处理完成后系统通知", "System notification on completion")}</span></label>
               <label className="watcher-check"><input type="checkbox" checked={watcherSettings.showFloatingResult ?? false} disabled={!nativeBridge} onChange={(event) => setWatcherSettings((current) => ({ ...current, showFloatingResult: event.target.checked }))} /><span>{t("处理完成后弹出悬浮窗", "Show floating result after processing")}</span></label>

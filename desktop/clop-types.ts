@@ -112,6 +112,10 @@ export type QuickCompressSettings = {
   renameTemplate?: string;
   fixedFolder?: string;
   targetSizeKb?: number;
+  resize?: boolean;
+  resizeMode?: "shrink" | "fit" | "exact";
+  maxWidth?: number;
+  maxHeight?: number;
 };
 
 export type QuickCompressResult = {
@@ -203,6 +207,7 @@ export type WatcherSettings = {
   scale: number;
   format: string;
   resize: boolean;
+  resizeMode?: "shrink" | "fit" | "exact";
   maxWidth: number;
   maxHeight: number;
   stripMetadata: boolean;

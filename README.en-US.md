@@ -19,12 +19,16 @@ A local-first image optimiser for content creators and developers, available on 
 - Optionally exclude floating results from system screenshots and recordings on macOS and Windows; third-party capture tools may choose not to honor OS protection
 - Replace, rename beside the source, or export to a fixed folder with scheduled cleanup
 - Upload to WebDAV, S3/R2, OSS, FTP, or SFTP image hosts
-- Load local HTML/JavaScript or URL workbench plugins; the library and folder watcher can also be toggled independently
+- Built-in batch rename, format conversion, and resize/enlarge plugins, plus local HTML/JavaScript and URL workbench plugins
 - Tauri 2 + Rust desktop apps; images stay on your device by default
 
 ### Built-in plugin: Batch rename
 
-Batch rename lives on its own plugin page. It extracts regex captures from ancestor folders at any depth, supports zero-padding and templates, and previews conflicts before applying changes. Folder monitoring can reuse the same parent-folder naming rules.
+Batch rename lives on its own plugin page. It extracts regex captures from ancestor folders at any depth, supports zero-padding and templates, and previews conflicts before applying changes. Custom rules can be saved, updated, and restored as the last-used rule. Folder monitoring can reuse the same parent-folder naming rules.
+
+### Built-in plugins: Convert and resize
+
+The converter batches JPEG, WebP, or PNG output with the same high-quality, balanced, smaller, and manual modes as the workbench. The resize plugin uses SIMD-accelerated Lanczos3 scaling for percentages, a fixed width or height, bounding boxes, and exact dimensions. Either plugin can copy its settings into a new watched-folder task.
 
 ### Floating-window workflow
 
@@ -123,13 +127,13 @@ npm run desktop:build
 
 ### Built-in plugin: Batch image rename
 
-Open **Settings → Batch rename** and choose a root folder. This built-in plugin is enabled by default and can be disabled under **Settings → Plugins**. PicLite scans images recursively, searches ancestor folder names up to the selected root, and stops at the first matching parent.
+Open **Batch rename** in the main window and choose a root folder. This built-in plugin is enabled by default and can be disabled under **Settings → Plugins**. PicLite scans images recursively, searches ancestor folder names up to the selected root, and stops at the first matching parent.
 
 - `A/A1/A11/【1-1】A111/A1111/photo.jfif` becomes `0101_photo.jfif` with the default rule.
 - Numeric captures are zero-padded (`1-1 → 0101`, `11-1 → 1101`) without truncating longer values.
 - Use `(风景|人物)` with `{1}_{name}` for Chinese words, or `([A-Za-z]+)` with `{1}_{name}` for English words.
 - `{1:initial}` keeps the first initial; `{1:initials}` turns `New York` into `NY`.
-- Templates also support `{code}`, `{name}`, `{ext}`, `{folder}`, `{match}`, `{1}`, `{2}`, `{index}`, and `{index:03}`. Review the preview before applying; unmatched files and existing targets are reported and never overwritten.
+- Templates also support `{code}`, `{name}`, `{ext}`, `{folder}`, `{match}`, `{1}`, `{2}`, `{index}`, and `{index:03}`. Review the preview before applying; unmatched files and existing targets are reported and never overwritten. Modified patterns, templates, separators, and conversion settings can be saved as reusable custom rules or used to update an existing custom rule.
 
 PicLite plugins are no longer embedded with an `iframe`. The desktop app fetches HTML/CSS/JavaScript and mounts it in a trusted workbench runtime, avoiding `X-Frame-Options` failures and allowing a custom tab name. Install only code you trust.
 

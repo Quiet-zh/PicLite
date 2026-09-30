@@ -18,6 +18,7 @@ arboard = "3.6"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 color_quant = "1.1"
+fast_image_resize = { version = "6.0", features = ["rayon"] }
 hmac = "0.12"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 notify = "8.2"
@@ -25,6 +26,7 @@ percent-encoding = "2.3"
 png = "0.18.1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 regex = "1"
+rayon = "1.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"

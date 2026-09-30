@@ -33,6 +33,8 @@ const loadedFontFaces = new Set<string>();
 const BUILTIN_WORKSPACE_PLUGINS: WorkspacePlugin[] = [
   { id: "watcher", nameZh: "文件夹监测", nameEn: "Folder watch", kind: "builtin", enabled: true },
   { id: "rename", nameZh: "图片批量重命名", nameEn: "Batch image rename", kind: "builtin", enabled: true },
+  { id: "convert", nameZh: "格式转换", nameEn: "Format converter", kind: "builtin", enabled: true },
+  { id: "resize", nameZh: "尺寸调整与扩图", nameEn: "Resize & enlarge", kind: "builtin", enabled: true },
   { id: "gallery", nameZh: "图库", nameEn: "Library", kind: "builtin", enabled: true },
 ];
 const SPONSOR_METHODS = [
