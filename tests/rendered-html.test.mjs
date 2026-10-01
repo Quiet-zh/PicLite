@@ -18,7 +18,8 @@ test("renders the PicLite product shell", async () => {
   const html = await response.text();
   assert.match(html, /<title>PicLite 图轻/);
   assert.match(html, /压缩工作台/);
-  assert.match(html, /文件夹监测/);
+  assert.doesNotMatch(html, />文件夹监测</);
+  assert.doesNotMatch(html, />批量重命名</);
   assert.match(html, /导入文件夹/);
   assert.match(html, /目标文件大小/);
   assert.match(html, /本地处理，图片不上传/);

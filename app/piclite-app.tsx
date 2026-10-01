@@ -18,7 +18,7 @@ import { disable as disableAutostart, enable as enableAutostart, isEnabled as is
 import { isRequestedMimeType, isSmartCompressionWorthwhile, minimumSmartSavingsBytes, smartCandidateOutputFormats } from "./compression-policy";
 import packageManifest from "../package.json";
 import { loadSettings as loadDesktopSettings, saveSettings as saveDesktopSettings } from "../desktop/clop-store";
-import { FormatConverterPlugin, ResizePlugin } from "./builtin-image-tools";
+import { FormatConverterPlugin, ResizePlugin, type NativeOutputFormat } from "./builtin-image-tools";
 
 type CompressionMode = "lossless" | "balanced" | "small" | "manual";
 type OutputFormat = "keep" | "image/jpeg" | "image/png" | "image/webp";
@@ -130,10 +130,11 @@ type WatcherSettings = {
   inputFolder: string;
   inputFolders: string[];
   outputFolder: string;
+  outputSuffix?: string;
   mode: CompressionMode;
   quality: number;
   scale: number;
-  format: OutputFormat;
+  format: NativeOutputFormat;
   resize: boolean;
   resizeMode?: "shrink" | "fit" | "exact";
   maxWidth: number;
@@ -356,7 +357,7 @@ type QuickCompressSettings = {
   mode?: "auto" | "balanced" | "small" | "lossless" | "manual";
   quality: number;
   scale: number;
-  format: OutputFormat;
+  format: NativeOutputFormat;
   stripMetadata: boolean;
   preventLarger: boolean;
   exportMode: Exclude<ExportMode, "download">;
@@ -407,19 +408,24 @@ type WorkspacePlugin = {
 };
 
 const BUILTIN_WORKSPACE_PLUGINS: WorkspacePlugin[] = [
-  { id: "watcher", nameZh: "文件夹监测", nameEn: "Folder watch", kind: "builtin", enabled: true },
-  { id: "rename", nameZh: "图片批量重命名", nameEn: "Batch image rename", kind: "builtin", enabled: true },
-  { id: "convert", nameZh: "格式转换", nameEn: "Format converter", kind: "builtin", enabled: true },
-  { id: "resize", nameZh: "尺寸调整与扩图", nameEn: "Resize & enlarge", kind: "builtin", enabled: true },
-  { id: "gallery", nameZh: "图库", nameEn: "Library", kind: "builtin", enabled: true },
+  { id: "watcher", nameZh: "文件夹监测", nameEn: "Folder watch", kind: "builtin", enabled: false },
+  { id: "rename", nameZh: "图片批量重命名", nameEn: "Batch image rename", kind: "builtin", enabled: false },
+  { id: "convert", nameZh: "格式转换", nameEn: "Format converter", kind: "builtin", enabled: false },
+  { id: "resize", nameZh: "尺寸调整与扩图", nameEn: "Resize & enlarge", kind: "builtin", enabled: false },
+  { id: "gallery", nameZh: "图库", nameEn: "Library", kind: "builtin", enabled: false },
 ];
+
+const WORKSPACE_PLUGINS_KEY = "piclite.workspacePlugins.v2";
+const LEGACY_WORKSPACE_PLUGINS_KEY = "piclite.workspacePlugins.v1";
 
 function loadWorkspacePlugins(): WorkspacePlugin[] {
   if (typeof window === "undefined") return BUILTIN_WORKSPACE_PLUGINS;
   try {
-    const saved = JSON.parse(window.localStorage.getItem("piclite.workspacePlugins.v1") || "[]") as WorkspacePlugin[];
-    const builtins = BUILTIN_WORKSPACE_PLUGINS.map((plugin) => ({ ...plugin, enabled: saved.find((item) => item.id === plugin.id)?.enabled ?? true }));
-    return [...builtins, ...saved.filter((plugin) => plugin.kind !== "builtin")];
+    const current = window.localStorage.getItem(WORKSPACE_PLUGINS_KEY);
+    const saved = JSON.parse(current || "[]") as WorkspacePlugin[];
+    const legacy = current ? [] : JSON.parse(window.localStorage.getItem(LEGACY_WORKSPACE_PLUGINS_KEY) || "[]") as WorkspacePlugin[];
+    const builtins = BUILTIN_WORKSPACE_PLUGINS.map((plugin) => ({ ...plugin, enabled: saved.find((item) => item.id === plugin.id)?.enabled ?? false }));
+    return [...builtins, ...(current ? saved : legacy).filter((plugin) => plugin.kind !== "builtin")];
   } catch { return BUILTIN_WORKSPACE_PLUGINS; }
 }
 
@@ -586,7 +592,7 @@ function loadRenameRules() {
   } catch { return DEFAULT_RENAME_RULES; }
 }
 
-function BatchRenamePage({ bridge, language, onCreateMonitor }: { bridge?: NativeBridge; language: "zh" | "en"; onCreateMonitor: (patch: Partial<WatcherSettings>) => void }) {
+function BatchRenamePage({ bridge, language, onCreateMonitor }: { bridge?: NativeBridge; language: "zh" | "en"; onCreateMonitor: (patch: Partial<WatcherSettings>, suggestedName: string) => Promise<string> }) {
   const t = useCallback((zh: string, en: string) => language === "en" ? en : zh, [language]);
   const [request, setRequest] = useState<BatchRenameRequest>(defaultRenameRequest);
   const [rulePresets, setRulePresets] = useState<RenameRulePreset[]>(loadRenameRules);
@@ -671,7 +677,7 @@ function BatchRenamePage({ bridge, language, onCreateMonitor }: { bridge?: Nativ
         <label className="rename-preserve"><span>{t("原图处理", "Original files")}</span><select value={request.preserveOriginal ? "copy" : "move"} onChange={(event) => patch({ preserveOriginal: event.target.value === "copy" })}><option value="move">{t("移动原图（仅保留处理结果）", "Move originals (keep results only)")}</option><option value="copy">{t("保留原图并生成新文件", "Keep originals and create new files")}</option></select><small>{t("已有目标文件始终跳过，不会覆盖", "Existing destination files are always skipped")}</small></label>
         <p className="rename-monitor-note">{t("需要持续自动处理时，可在“文件夹监测”中同时设置输出格式和父文件夹命名规则。", "For continuous automation, configure both output format and parent-folder naming in Folder Watch.")}</p>
       </div>
-      <div className="rename-actions"><button type="button" onClick={() => onCreateMonitor({ folderRename: request, format: request.outputFormat, quality: request.quality, mode: request.outputFormat === "keep" ? "lossless" : "manual" })}>◎ {t("建立监控任务", "Create watch task")}</button><button type="button" disabled={busy || !request.rootFolder} onClick={() => void scan()}>{busy ? "···" : "⌕"} {t("扫描并预览", "Scan and preview")}</button><button className="primary" type="button" disabled={busy || !preview?.entries.some((entry) => entry.ready)} onClick={() => void apply()}>{t("执行处理", "Apply changes")}</button></div>
+      <div className="rename-actions"><button type="button" onClick={async () => setStatus(await onCreateMonitor({ inputFolder: request.rootFolder, folderRename: request, format: request.outputFormat, quality: request.quality, mode: request.outputFormat === "keep" ? "lossless" : "manual" }, t("批量重命名", "Batch rename")))}>◎ {t("按此配置添加监控任务", "Add watch task with these settings")}</button><button type="button" disabled={busy || !request.rootFolder} onClick={() => void scan()}>{busy ? "···" : "⌕"} {t("扫描并预览", "Scan and preview")}</button><button className="primary" type="button" disabled={busy || !preview?.entries.some((entry) => entry.ready)} onClick={() => void apply()}>{t("执行处理", "Apply changes")}</button></div>
       {preview && <div className="rename-preview"><header><strong>{t("重命名预览", "Rename preview")}</strong><span>{t(`${preview.matched} 个匹配 · ${preview.failed} 个冲突`, `${preview.matched} matches · ${preview.failed} conflicts`)}</span></header>{preview.entries.slice(0, 200).map((entry) => <div className={entry.ready ? "ready" : "blocked"} key={entry.source}><span title={entry.source}>{entry.sourceName}</span><b>→</b><span title={entry.target}>{entry.targetName || entry.error}</span><small>{entry.error || entry.code}</small></div>)}</div>}
     </div>
   </section>;
@@ -1832,7 +1838,7 @@ function fileNameFromPath(path: string) {
   return path.split(/[\\/]/).pop() || path;
 }
 
-const SUPPORTED_IMAGE_PATH = /\.(?:jpe?g|jfif|png|webp|gif|avif|tiff?)$/i;
+const SUPPORTED_IMAGE_PATH = /\.(?:jpe?g|jfif|png|webp|gif|avif|bmp|tiff?|ico|qoi|tga)$/i;
 
 function supportedImagePaths(paths: string[]) {
   return [...new Set(paths.filter((path) => SUPPORTED_IMAGE_PATH.test(fileNameFromPath(path))))];
@@ -2404,12 +2410,12 @@ function PicLiteWorkbench({ nativeBridge, initialView = "workspace", standaloneP
   const hydratedWatermarkFontRef = useRef<string | null>(null);
   const importedFontsHydratedRef = useRef(false);
   useEffect(() => {
-    try { window.localStorage.setItem("piclite.workspacePlugins.v1", JSON.stringify(workspacePlugins)); window.dispatchEvent(new Event("piclite:plugins-changed")); }
+    try { window.localStorage.setItem(WORKSPACE_PLUGINS_KEY, JSON.stringify(workspacePlugins)); window.dispatchEvent(new Event("piclite:plugins-changed")); }
     catch (error) { console.warn("Could not persist PicLite plugins", error); }
   }, [workspacePlugins]);
   useEffect(() => {
     const syncPlugins = (event: StorageEvent) => {
-      if (event.key === "piclite.workspacePlugins.v1") setWorkspacePlugins(loadWorkspacePlugins());
+      if (event.key === WORKSPACE_PLUGINS_KEY) setWorkspacePlugins(loadWorkspacePlugins());
     };
     window.addEventListener("storage", syncPlugins);
     return () => window.removeEventListener("storage", syncPlugins);
@@ -3697,13 +3703,36 @@ function PicLiteWorkbench({ nativeBridge, initialView = "workspace", standaloneP
     setWatcherSettings({ ...DEFAULT_WATCHER_SETTINGS });
   }, []);
 
-  const createMonitorFromTool = useCallback((patch: Partial<WatcherSettings>) => {
-    setSelectedWatchProfileId(null);
-    setWatchProfileName("");
-    setWatcherSettings({ ...DEFAULT_WATCHER_SETTINGS, ...patch });
-    setView("watcher");
-    showToast(t("处理参数已带入新的监控任务，请选择监测文件夹", "Settings copied to a new watch task; choose a folder to watch"));
-  }, [showToast, t]);
+  const createMonitorFromTool = useCallback(async (patch: Partial<WatcherSettings>, suggestedName: string) => {
+    if (!nativeBridge) return t("此功能需要桌面客户端", "This feature requires the desktop app");
+    try {
+      const inputFolder = patch.inputFolder || await nativeBridge.selectFolder("input");
+      if (!inputFolder) return t("已取消创建监控任务", "Watch task creation cancelled");
+      const folderName = inputFolder.split(/[\\/]/).filter(Boolean).pop() || t("文件夹", "Folder");
+      const profile: WatchProfile = {
+        ...DEFAULT_WATCHER_SETTINGS,
+        ...patch,
+        id: `watch-${uid()}`,
+        name: `${suggestedName} · ${folderName}`,
+        enabled: true,
+        inputFolder,
+        inputFolders: [],
+      };
+      const next = [...watchProfiles, profile];
+      const active = next.filter((item) => item.enabled);
+      const validation = await nativeBridge.validateWatcher({ ...profile, profiles: active });
+      if (!validation.ok) return validation.error || t("监控规则无效", "Invalid watch rules");
+      const result = await nativeBridge.startWatcher({ ...profile, profiles: active }, true);
+      if (!result.ok) return result.error || t("无法启动文件夹监测", "Could not start folder watching");
+      persistWatchProfiles(next);
+      setSelectedWatchProfileId(profile.id);
+      setWatchProfileName(profile.name);
+      setWatcherSettings(profile);
+      return t(`监控任务“${profile.name}”已开始；可在设置中显示“文件夹监测”进行管理`, `Watch task “${profile.name}” is running; show Folder Watch in Settings to manage it`);
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  }, [nativeBridge, persistWatchProfiles, t, watchProfiles]);
 
   const toggleWatchProfile = useCallback(async (profile: WatchProfile) => {
     if (!nativeBridge) return;
@@ -4215,7 +4244,7 @@ function PicLiteWorkbench({ nativeBridge, initialView = "workspace", standaloneP
                 const quality = mode === "lossless" ? 92 : mode === "balanced" ? 82 : 45;
                 setWatcherSettings((current) => ({ ...current, mode, quality }));
               }}><option value="lossless">{t("无损优先", "Lossless")}</option><option value="balanced">{t("智能平衡", "Smart balance")}</option><option value="small">{t("更小体积", "Smaller files")}</option></select></label>
-              <label><span>{t("输出格式", "Output format")}</span><select value={watcherSettings.format} disabled={!nativeBridge} onChange={(event) => setWatcherSettings((current) => ({ ...current, format: event.target.value as OutputFormat }))}><option value="keep">{watcherSettings.mode === "manual" ? t("保持原格式", "Keep original") : t("智能择优格式", "Auto-select best format")}</option><option value="image/jpeg">JPG / JFIF</option><option value="image/png">PNG</option><option value="image/webp">WebP</option></select></label>
+              <label><span>{t("输出格式", "Output format")}</span><select value={watcherSettings.format} disabled={!nativeBridge} onChange={(event) => setWatcherSettings((current) => ({ ...current, format: event.target.value as NativeOutputFormat }))}><option value="keep">{watcherSettings.mode === "manual" ? t("保持原格式", "Keep original") : t("智能择优格式", "Auto-select best format")}</option><option value="image/webp">WebP</option><option value="image/jpeg">JPEG</option><option value="image/jfif">JFIF</option><option value="image/png">PNG</option><option value="image/avif">AVIF</option><option value="image/gif">GIF</option><option value="image/bmp">BMP</option><option value="image/tiff">TIFF</option><option value="image/x-icon">ICO (≤ 256px)</option><option value="image/qoi">QOI</option><option value="image/x-tga">TGA</option></select></label>
               <label className="watcher-range"><span>{t("画质", "Quality")} <b>{watcherSettings.quality}%</b></span><input type="range" min="1" max="100" step="1" value={watcherSettings.quality} disabled={!nativeBridge} onChange={(event) => {
                 const quality = Number(event.target.value);
                 setWatcherSettings((current) => ({ ...current, quality, mode: modeFromQuality(quality) }));

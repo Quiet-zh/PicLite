@@ -20,7 +20,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 color_quant = "1.1"
 fast_image_resize = { version = "6.0", features = ["rayon"] }
 hmac = "0.12"
-image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["avif", "bmp", "gif", "ico", "jpeg", "png", "qoi", "tga", "tiff", "webp"] }
 notify = "8.2"
 percent-encoding = "2.3"
 png = "0.18.1"

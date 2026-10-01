@@ -3,6 +3,7 @@ import { disable as disableAutostart, enable as enableAutostart, isEnabled as is
 import { Icon } from "./clop-icons";
 import { copyImageWithFeedback } from "./operation-feedback";
 import type { OperationFeedbackTone } from "./operation-feedback";
+import { nextReencodeSource } from "./result-source";
 import { fileName, formatBytes, loadSettings, nativePathIdentity, resolveOptimisationPreset, saveSettings, subscribeSettings, toNativeFormat, tr } from "./clop-store";
 import type { DesktopSettings, FloatingAction, FloatingWatermark, ImageFormat, Language, OptimisationPreset, PicLiteBridge, QuickCompressResult, QuickCompressSettings, StoredUploadProfile } from "./clop-types";
 import packageManifest from "../package.json";
@@ -24,18 +25,19 @@ const bridge = window.picLite as unknown as PicLiteBridge | undefined;
 
 type SystemFontInfo = { family: string; path: string; faceIndex: number };
 type WorkspacePlugin = { id: string; nameZh: string; nameEn: string; kind: "builtin" | "html" | "url"; enabled: boolean; source?: string; url?: string };
-const WORKSPACE_PLUGINS_KEY = "piclite.workspacePlugins.v1";
+const WORKSPACE_PLUGINS_KEY = "piclite.workspacePlugins.v2";
+const LEGACY_WORKSPACE_PLUGINS_KEY = "piclite.workspacePlugins.v1";
 const REQUESTED_SETTINGS_SECTION_KEY = "piclite.preferences.requested-section";
 const APP_VERSION = packageManifest.version;
 const APP_RELEASE_DATE = packageManifest.releaseDate;
 const LAST_UPDATE_CHECK_KEY = "piclite.update.last-checked.v1";
 const loadedFontFaces = new Set<string>();
 const BUILTIN_WORKSPACE_PLUGINS: WorkspacePlugin[] = [
-  { id: "watcher", nameZh: "文件夹监测", nameEn: "Folder watch", kind: "builtin", enabled: true },
-  { id: "rename", nameZh: "图片批量重命名", nameEn: "Batch image rename", kind: "builtin", enabled: true },
-  { id: "convert", nameZh: "格式转换", nameEn: "Format converter", kind: "builtin", enabled: true },
-  { id: "resize", nameZh: "尺寸调整与扩图", nameEn: "Resize & enlarge", kind: "builtin", enabled: true },
-  { id: "gallery", nameZh: "图库", nameEn: "Library", kind: "builtin", enabled: true },
+  { id: "watcher", nameZh: "文件夹监测", nameEn: "Folder watch", kind: "builtin", enabled: false },
+  { id: "rename", nameZh: "图片批量重命名", nameEn: "Batch image rename", kind: "builtin", enabled: false },
+  { id: "convert", nameZh: "格式转换", nameEn: "Format converter", kind: "builtin", enabled: false },
+  { id: "resize", nameZh: "尺寸调整与扩图", nameEn: "Resize & enlarge", kind: "builtin", enabled: false },
+  { id: "gallery", nameZh: "图库", nameEn: "Library", kind: "builtin", enabled: false },
 ];
 const SPONSOR_METHODS = [
   { id: "alipay", image: "/sponsor/alipay.png", zh: "支付宝", en: "Alipay" },
@@ -51,7 +53,7 @@ const CREATOR_LINKS = [
   { id: "x", icon: "x-social", label: "X", url: "https://x.com/amiaoapp" },
   { id: "telegram", icon: "telegram", label: "Telegram", url: "https://t.me/miaoaaaaa" },
 ] as const;
-const SUPPORTED_IMAGE_PATH = /\.(?:jpe?g|jfif|png|webp|gif|avif|tiff?)$/i;
+const SUPPORTED_IMAGE_PATH = /\.(?:jpe?g|jfif|png|webp|gif|avif|bmp|tiff?|ico|qoi|tga)$/i;
 
 function supportedImagePaths(paths: string[]) {
   return [...new Set(paths.filter((path) => SUPPORTED_IMAGE_PATH.test(fileName(path))))];
@@ -59,8 +61,13 @@ function supportedImagePaths(paths: string[]) {
 
 function loadWorkspacePlugins() {
   try {
-    const saved = JSON.parse(localStorage.getItem(WORKSPACE_PLUGINS_KEY) || "[]") as WorkspacePlugin[];
-    return [...BUILTIN_WORKSPACE_PLUGINS.map((plugin) => ({ ...plugin, enabled: saved.find((item) => item.id === plugin.id)?.enabled ?? true })), ...saved.filter((plugin) => plugin.kind !== "builtin")];
+    const current = localStorage.getItem(WORKSPACE_PLUGINS_KEY);
+    const saved = JSON.parse(current || "[]") as WorkspacePlugin[];
+    const legacy = current ? [] : JSON.parse(localStorage.getItem(LEGACY_WORKSPACE_PLUGINS_KEY) || "[]") as WorkspacePlugin[];
+    return [
+      ...BUILTIN_WORKSPACE_PLUGINS.map((plugin) => ({ ...plugin, enabled: saved.find((item) => item.id === plugin.id)?.enabled ?? false })),
+      ...(current ? saved : legacy).filter((plugin) => plugin.kind !== "builtin"),
+    ];
   } catch {
     return BUILTIN_WORKSPACE_PLUGINS;
   }
@@ -266,7 +273,10 @@ function useOptimiser(api: PicLiteBridge | undefined, settings: DesktopSettings)
         ...output,
         source: originalSource,
         originalSource,
-        reencodeSource: sourceOverride || item.reencodeSource,
+        // A structural edit (resize/watermark) becomes the baseline for every
+        // later format switch. Keeping the pre-edit source here caused the UI
+        // to re-encode the larger image and made the result grow again.
+        reencodeSource: nextReencodeSource(sourceOverride, output.output, item.reencodeSource),
         originalBytes: item.originalBytes ?? output.originalBytes,
         smartCompression,
         formatChoice: smartCompression ? "auto" : undefined,
@@ -608,7 +618,8 @@ function FloatingResults({ api }: { api: PicLiteBridge }) {
     await reoptimise(item, {
       mode: smartCompression ? "auto" : "manual",
       format,
-      scale: smartCompression ? 100 : settings.preset.scale,
+      scale: 100,
+      preventLarger: true,
     });
   };
   const undo = (item: ResultItem) => setResults((current) => current.map((candidate) => {

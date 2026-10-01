@@ -22,6 +22,7 @@ use fast_image_resize::{
 use hmac::{Hmac, Mac};
 use image::{
     codecs::{
+        avif::AvifEncoder,
         gif::{GifDecoder, GifEncoder, Repeat},
         jpeg::JpegEncoder,
         png::{CompressionType, FilterType as PngFilterType, PngEncoder},
@@ -57,7 +58,7 @@ use webp::{
 use webp::{Encoder as LossyWebPEncoder, WebPConfig};
 
 const IMAGE_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "jfif", "png", "webp", "gif", "avif", "tif", "tiff",
+    "jpg", "jpeg", "jfif", "png", "webp", "gif", "avif", "bmp", "tif", "tiff", "ico", "qoi", "tga",
 ];
 
 #[derive(Default)]
@@ -1183,7 +1184,11 @@ fn mime_for(path: &Path) -> &'static str {
         "webp" => "image/webp",
         "gif" => "image/gif",
         "avif" => "image/avif",
+        "bmp" => "image/bmp",
         "tif" | "tiff" => "image/tiff",
+        "ico" => "image/x-icon",
+        "qoi" => "image/qoi",
+        "tga" => "image/x-tga",
         _ => "application/octet-stream",
     }
 }
@@ -1191,8 +1196,16 @@ fn mime_for(path: &Path) -> &'static str {
 fn extension_for(path: &Path, format: &str) -> String {
     match format {
         "image/jpeg" => "jpg".to_string(),
+        "image/jfif" => "jfif".to_string(),
         "image/png" => "png".to_string(),
         "image/webp" => "webp".to_string(),
+        "image/avif" => "avif".to_string(),
+        "image/gif" => "gif".to_string(),
+        "image/bmp" => "bmp".to_string(),
+        "image/tiff" => "tiff".to_string(),
+        "image/x-icon" => "ico".to_string(),
+        "image/qoi" => "qoi".to_string(),
+        "image/x-tga" => "tga".to_string(),
         _ => path
             .extension()
             .and_then(|value| value.to_str())
@@ -1777,7 +1790,7 @@ fn optimize_webp_animation(
     settings: &WatcherSettings,
 ) -> Result<OptimizedImage, String> {
     if !matches!(settings.format.as_str(), "keep" | "image/webp") {
-        return Err("动态 WebP 只能保持 WebP 格式，不能转换为静态 JPG 或 PNG".to_string());
+        return Err("动态 WebP 只能保持 WebP 格式，不能转换为静态图片格式".to_string());
     }
     let animation = decode_webp_animation(original)?;
     let (target_width, target_height) =
@@ -1992,6 +2005,45 @@ fn encode_static_ref(
                 encoded.extend_from_slice(webp.as_ref());
             }
         }
+        "avif" => {
+            let rgba = image.to_rgba8();
+            AvifEncoder::new_with_speed_quality(&mut encoded, 8, quality.clamp(1, 100))
+                .with_num_threads(Some(2))
+                .write_image(
+                    &rgba,
+                    rgba.width(),
+                    rgba.height(),
+                    image::ExtendedColorType::Rgba8,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        "gif" | "bmp" | "tif" | "tiff" | "ico" | "qoi" | "tga" => {
+            let format = match output_extension {
+                "gif" => image::ImageFormat::Gif,
+                "bmp" => image::ImageFormat::Bmp,
+                "tif" | "tiff" => image::ImageFormat::Tiff,
+                "ico" => image::ImageFormat::Ico,
+                "qoi" => image::ImageFormat::Qoi,
+                "tga" => image::ImageFormat::Tga,
+                _ => unreachable!(),
+            };
+            let mut cursor = Cursor::new(Vec::new());
+            if output_extension == "ico" {
+                let ico_image = if image.width() > 256 || image.height() > 256 {
+                    image.resize(256, 256, FilterType::Lanczos3)
+                } else {
+                    image.clone()
+                };
+                DynamicImage::ImageRgba8(ico_image.to_rgba8())
+                    .write_to(&mut cursor, format)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                image
+                    .write_to(&mut cursor, format)
+                    .map_err(|error| error.to_string())?;
+            }
+            encoded = cursor.into_inner();
+        }
         _ => return Err(format!("自动监测暂不支持编码 .{output_extension}")),
     }
     Ok(encoded)
@@ -2125,7 +2177,12 @@ fn optimize_image_data_unconstrained(
     source_extension: String,
     settings: &WatcherSettings,
 ) -> Result<OptimizedImage, String> {
-    if source_extension == "gif" && matches!(settings.format.as_str(), "keep" | "image/webp") {
+    if source_extension == "gif"
+        && matches!(
+            settings.format.as_str(),
+            "keep" | "image/webp" | "image/gif"
+        )
+    {
         return optimize_gif_animation(&original, settings);
     }
     if source_extension == "webp" && is_animated_webp(&original) {
@@ -2164,8 +2221,16 @@ fn optimize_image_data_unconstrained(
             } else {
                 quality
             };
+            let candidate = encode_static_ref(&resized, &output_extension, explicit_quality)?;
+            let resized_pixels = target_width != width || target_height != height;
+            if settings.prevent_larger && !resized_pixels && candidate.len() >= original.len() {
+                return Ok(OptimizedImage {
+                    bytes: original,
+                    extension: source_extension,
+                });
+            }
             return Ok(OptimizedImage {
-                bytes: encode_static_ref(&resized, &output_extension, explicit_quality)?,
+                bytes: candidate,
                 extension: output_extension,
             });
         }
@@ -2256,8 +2321,7 @@ fn optimize_image_data_unconstrained(
     };
     let encode_quality = settings.quality;
     let candidate = encode_static(resized.clone(), &output_extension, encode_quality)?;
-    let visual_transform =
-        target_width != width || target_height != height || settings.format != "keep";
+    let visual_transform = target_width != width || target_height != height;
     if settings.prevent_larger && candidate.len() >= original.len() {
         if visual_transform && settings.mode != "lossless" {
             let mut smallest = candidate;
@@ -6549,6 +6613,109 @@ mod tests {
         let resized = resize_dynamic_fast(image, 80, 40).expect("SIMD resize");
         assert_eq!(resized.dimensions(), (80, 40));
         assert!(resized.to_rgba8().pixels().any(|pixel| pixel.0[3] < 255));
+    }
+
+    #[test]
+    fn format_converter_encodes_all_advertised_static_formats() {
+        let source = DynamicImage::ImageRgb8(image::RgbImage::from_fn(24, 16, |x, y| {
+            image::Rgb([(x * 9) as u8, (y * 13) as u8, ((x + y) * 5) as u8])
+        }));
+        for extension in [
+            "jpg", "jfif", "png", "webp", "avif", "gif", "bmp", "tiff", "ico", "qoi", "tga",
+        ] {
+            let encoded = encode_static_ref(&source, extension, 82)
+                .unwrap_or_else(|error| panic!("encode {extension}: {error}"));
+            assert!(
+                !encoded.is_empty(),
+                "{extension} output should not be empty"
+            );
+            if extension == "avif" {
+                assert!(
+                    encoded.windows(4).any(|window| window == b"ftyp"),
+                    "AVIF container marker"
+                );
+                continue;
+            }
+            let format = match extension {
+                "jpg" | "jfif" => image::ImageFormat::Jpeg,
+                "png" => image::ImageFormat::Png,
+                "webp" => image::ImageFormat::WebP,
+                "gif" => image::ImageFormat::Gif,
+                "bmp" => image::ImageFormat::Bmp,
+                "tiff" => image::ImageFormat::Tiff,
+                "ico" => image::ImageFormat::Ico,
+                "qoi" => image::ImageFormat::Qoi,
+                "tga" => image::ImageFormat::Tga,
+                _ => unreachable!(),
+            };
+            let decoded = image::load_from_memory_with_format(&encoded, format)
+                .unwrap_or_else(|error| panic!("decode {extension}: {error}"));
+            assert_eq!(decoded.dimensions(), (24, 16), "{extension} dimensions");
+        }
+        let large_ico = encode_static_ref(&DynamicImage::new_rgba8(400, 200), "ico", 82)
+            .expect("encode a standards-compliant large icon");
+        assert_eq!(
+            image::load_from_memory_with_format(&large_ico, image::ImageFormat::Ico)
+                .expect("decode resized ICO")
+                .dimensions(),
+            (256, 128),
+        );
+    }
+
+    #[test]
+    fn format_switch_size_guard_keeps_the_latest_smaller_source() {
+        let source = DynamicImage::new_rgb8(32, 24);
+        let original = encode_static_ref(&source, "png", 100).expect("encode compact PNG");
+        let settings: WatcherSettings = serde_json::from_value(serde_json::json!({
+            "inputFolder": "", "inputFolders": [], "outputFolder": "",
+            "mode": "manual", "quality": 82, "scale": 100, "format": "image/bmp",
+            "resize": false, "maxWidth": 4096, "maxHeight": 4096,
+            "stripMetadata": true, "preventLarger": true
+        }))
+        .expect("format switch settings");
+        let result = optimize_image_data(original.clone(), "png".to_string(), &settings)
+            .expect("guarded format switch");
+        assert_eq!(result.extension, "png");
+        assert_eq!(result.bytes, original);
+    }
+
+    #[test]
+    fn format_switch_does_not_resize_an_already_resized_result_again() {
+        let source = DynamicImage::ImageRgb8(image::RgbImage::from_fn(400, 200, |x, y| {
+            image::Rgb([(x % 255) as u8, (y % 255) as u8, ((x + y) % 255) as u8])
+        }));
+        let original = encode_static_ref(&source, "png", 100).expect("encode resize source");
+        let resize_settings: WatcherSettings = serde_json::from_value(serde_json::json!({
+            "inputFolder": "", "inputFolders": [], "outputFolder": "",
+            "mode": "manual", "quality": 82, "scale": 50, "format": "image/webp",
+            "resize": false, "maxWidth": 4096, "maxHeight": 4096,
+            "stripMetadata": true, "preventLarger": false
+        }))
+        .expect("resize settings");
+        let resized = optimize_image_data(original, "png".to_string(), &resize_settings)
+            .expect("resize source");
+        assert_eq!(
+            image::load_from_memory(&resized.bytes)
+                .unwrap()
+                .dimensions(),
+            (200, 100)
+        );
+
+        let switch_settings: WatcherSettings = serde_json::from_value(serde_json::json!({
+            "inputFolder": "", "inputFolders": [], "outputFolder": "",
+            "mode": "manual", "quality": 82, "scale": 100, "format": "image/jpeg",
+            "resize": false, "maxWidth": 4096, "maxHeight": 4096,
+            "stripMetadata": true, "preventLarger": true
+        }))
+        .expect("format switch settings");
+        let switched = optimize_image_data(resized.bytes, resized.extension, &switch_settings)
+            .expect("switch resized format");
+        assert_eq!(
+            image::load_from_memory(&switched.bytes)
+                .unwrap()
+                .dimensions(),
+            (200, 100)
+        );
     }
 
     #[test]

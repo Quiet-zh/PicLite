@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { copyImageWithFeedback } from "../desktop/operation-feedback.ts";
+import { nextReencodeSource } from "../desktop/result-source.ts";
+
+test("a resized result becomes the baseline for later format switches", () => {
+  assert.equal(nextReencodeSource("/tmp/before-resize.webp", "/tmp/resized.webp", "/tmp/old.webp"), "/tmp/resized.webp");
+  assert.equal(nextReencodeSource(undefined, "/tmp/switched.jpg", "/tmp/resized.webp"), "/tmp/resized.webp");
+});
 
 test("floating copy reports success after the clipboard write completes", async () => {
   const events = [];
