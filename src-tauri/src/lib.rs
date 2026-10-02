@@ -4212,6 +4212,39 @@ fn write_clipboard_image(data: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("无法写入系统剪贴板：{error}"))
 }
 
+fn copy_image_path_payload_with<F, B>(
+    path: &Path,
+    prefer_bitmap: bool,
+    mut copy_file: F,
+    mut copy_bitmap: B,
+) -> Result<(), String>
+where
+    F: FnMut(&Path) -> Result<(), String>,
+    B: FnMut(&[u8]) -> Result<(), String>,
+{
+    let read_bitmap = || fs::read(path).map_err(|error| format!("无法读取结果图：{error}"));
+    if prefer_bitmap {
+        let data = read_bitmap()?;
+        return copy_bitmap(&data);
+    }
+    copy_file(path).or_else(|_| {
+        let data = read_bitmap()?;
+        copy_bitmap(&data)
+    })
+}
+
+fn copy_image_path_to_clipboard(path: &Path) -> Result<(), String> {
+    // Windows applications commonly prefer the existing CF_DIB bitmap over a
+    // newly supplied CF_HDROP file list. Writing the optimised pixels directly
+    // guarantees that paste receives the result instead of the previous source.
+    copy_image_path_payload_with(
+        path,
+        cfg!(target_os = "windows"),
+        copy_file_to_clipboard,
+        write_clipboard_image,
+    )
+}
+
 #[cfg(target_os = "macos")]
 fn copy_file_to_clipboard(path: &Path) -> Result<(), String> {
     let status = Command::new("osascript")
@@ -4387,15 +4420,15 @@ async fn cache_image_data(
 
 #[tauri::command]
 async fn copy_image_path(path: String, state: State<'_, DesktopState>) -> Result<(), String> {
+    // Suppress before writing because Windows can notify the monitor before the
+    // blocking clipboard operation returns to this async command.
+    suppress_next_clipboard_observation(&state);
     let result = tauri::async_runtime::spawn_blocking(move || {
         let path = PathBuf::from(path);
         if !path.is_file() {
             return Err("结果文件已经不存在".to_string());
         }
-        copy_file_to_clipboard(&path).or_else(|_| {
-            let data = fs::read(&path).map_err(|error| error.to_string())?;
-            write_clipboard_image(&data)
-        })
+        copy_image_path_to_clipboard(&path)
     })
     .await
     .map_err(|error| error.to_string())?;
@@ -7844,6 +7877,33 @@ mod tests {
             ),
             Some(vec![readable])
         );
+    }
+
+    #[test]
+    fn windows_floating_copy_writes_optimised_pixels_instead_of_a_file_list() {
+        let path = std::env::temp_dir().join(format!("piclite-copy-result-{}.webp", now_ms()));
+        let optimised = b"optimised-result";
+        fs::write(&path, optimised).expect("write optimised result fixture");
+        let mut copied_file = false;
+        let mut copied_bitmap = Vec::new();
+
+        copy_image_path_payload_with(
+            &path,
+            true,
+            |_| {
+                copied_file = true;
+                Ok(())
+            },
+            |data| {
+                copied_bitmap.extend_from_slice(data);
+                Ok(())
+            },
+        )
+        .expect("copy optimised pixels");
+
+        assert!(!copied_file);
+        assert_eq!(copied_bitmap, optimised);
+        fs::remove_file(path).expect("remove optimised result fixture");
     }
 
     #[test]
