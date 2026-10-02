@@ -89,7 +89,7 @@ docker compose logs -f piclite
 ```dotenv
 PICLITE_BIND=0.0.0.0
 PICLITE_PORT=3456
-PICLITE_TAG=1.8.8
+PICLITE_TAG=1.8.9
 ```
 
 如需从当前源码本地构建：

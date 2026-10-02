@@ -4212,9 +4212,23 @@ fn write_clipboard_image(data: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("无法写入系统剪贴板：{error}"))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImagePathClipboardMode {
+    FileOnly,
+    FileWithBitmapFallback,
+}
+
+fn image_path_clipboard_mode(target_os: &str) -> ImagePathClipboardMode {
+    if target_os == "windows" {
+        ImagePathClipboardMode::FileOnly
+    } else {
+        ImagePathClipboardMode::FileWithBitmapFallback
+    }
+}
+
 fn copy_image_path_payload_with<F, B>(
     path: &Path,
-    prefer_bitmap: bool,
+    mode: ImagePathClipboardMode,
     mut copy_file: F,
     mut copy_bitmap: B,
 ) -> Result<(), String>
@@ -4222,24 +4236,22 @@ where
     F: FnMut(&Path) -> Result<(), String>,
     B: FnMut(&[u8]) -> Result<(), String>,
 {
-    let read_bitmap = || fs::read(path).map_err(|error| format!("无法读取结果图：{error}"));
-    if prefer_bitmap {
-        let data = read_bitmap()?;
-        return copy_bitmap(&data);
+    match (mode, copy_file(path)) {
+        (_, Ok(())) => Ok(()),
+        (ImagePathClipboardMode::FileOnly, Err(error)) => Err(error),
+        (ImagePathClipboardMode::FileWithBitmapFallback, Err(_)) => {
+            let data = fs::read(path).map_err(|error| format!("无法读取结果图：{error}"))?;
+            copy_bitmap(&data)
+        }
     }
-    copy_file(path).or_else(|_| {
-        let data = read_bitmap()?;
-        copy_bitmap(&data)
-    })
 }
 
 fn copy_image_path_to_clipboard(path: &Path) -> Result<(), String> {
-    // Windows applications commonly prefer the existing CF_DIB bitmap over a
-    // newly supplied CF_HDROP file list. Writing the optimised pixels directly
-    // guarantees that paste receives the result instead of the previous source.
+    // Windows must keep the encoded result as a file payload. Falling back to a
+    // bitmap makes receiving apps re-encode WebP as a much larger PNG.
     copy_image_path_payload_with(
         path,
-        cfg!(target_os = "windows"),
+        image_path_clipboard_mode(std::env::consts::OS),
         copy_file_to_clipboard,
         write_clipboard_image,
     )
@@ -4271,25 +4283,25 @@ fn copy_file_to_clipboard(path: &Path) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut command = Command::new("powershell.exe");
-    command
-        .creation_flags(CREATE_NO_WINDOW)
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-STA",
-            "-Command",
-            "Add-Type -AssemblyName System.Windows.Forms; $files = New-Object System.Collections.Specialized.StringCollection; [void]$files.Add($args[0]); [System.Windows.Forms.Clipboard]::SetFileDropList($files)",
-        ])
-        .arg(path);
-    let status = command
-        .status()
-        .map_err(|error| format!("无法调用系统剪贴板：{error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("系统未能复制压缩文件".to_string())
+    let script = "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; $path=$env:PICLITE_CLIPBOARD_FILE; if (-not [IO.File]::Exists($path)) { throw 'Result file does not exist' }; $files=New-Object System.Collections.Specialized.StringCollection; [void]$files.Add($path); [System.Windows.Forms.Clipboard]::Clear(); [System.Windows.Forms.Clipboard]::SetFileDropList($files)";
+    let mut last_error = None;
+    for _ in 0..3 {
+        let status = Command::new("powershell.exe")
+            .creation_flags(CREATE_NO_WINDOW)
+            .env("PICLITE_CLIPBOARD_FILE", path)
+            .args(["-NoProfile", "-NonInteractive", "-STA", "-Command", script])
+            .status();
+        match status {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => last_error = Some(format!("PowerShell exit code {status}")),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        std::thread::sleep(Duration::from_millis(80));
     }
+    Err(format!(
+        "系统未能复制压缩文件：{}",
+        last_error.unwrap_or_else(|| "unknown clipboard error".to_string())
+    ))
 }
 
 fn suppress_next_clipboard_observation(state: &DesktopState) {
@@ -7880,30 +7892,49 @@ mod tests {
     }
 
     #[test]
-    fn windows_floating_copy_writes_optimised_pixels_instead_of_a_file_list() {
+    fn windows_floating_copy_keeps_the_optimised_file_payload() {
         let path = std::env::temp_dir().join(format!("piclite-copy-result-{}.webp", now_ms()));
         let optimised = b"optimised-result";
         fs::write(&path, optimised).expect("write optimised result fixture");
-        let mut copied_file = false;
-        let mut copied_bitmap = Vec::new();
+        let mut copied_file = None;
+        let mut copied_bitmap = false;
 
         copy_image_path_payload_with(
             &path,
-            true,
-            |_| {
-                copied_file = true;
+            image_path_clipboard_mode("windows"),
+            |candidate| {
+                copied_file = Some(candidate.to_path_buf());
                 Ok(())
             },
-            |data| {
-                copied_bitmap.extend_from_slice(data);
+            |_| {
+                copied_bitmap = true;
                 Ok(())
             },
         )
-        .expect("copy optimised pixels");
+        .expect("copy optimised file");
 
-        assert!(!copied_file);
-        assert_eq!(copied_bitmap, optimised);
+        assert_eq!(copied_file.as_deref(), Some(path.as_path()));
+        assert!(!copied_bitmap);
         fs::remove_file(path).expect("remove optimised result fixture");
+    }
+
+    #[test]
+    fn windows_floating_copy_does_not_hide_file_copy_failures_with_a_png_fallback() {
+        let path = Path::new("result.webp");
+        let mut copied_bitmap = false;
+        let error = copy_image_path_payload_with(
+            path,
+            image_path_clipboard_mode("windows"),
+            |_| Err("clipboard locked".to_string()),
+            |_| {
+                copied_bitmap = true;
+                Ok(())
+            },
+        )
+        .expect_err("Windows file copy failure must remain visible");
+
+        assert_eq!(error, "clipboard locked");
+        assert!(!copied_bitmap);
     }
 
     #[test]
